@@ -349,10 +349,9 @@ class NotebookLMClient:
         import random
         self._reqid_counter = random.randint(100000, 999999)
 
-        # Only refresh CSRF token if not provided - tokens actually last hours/days, not minutes
-        # The retry logic in _call_rpc() handles expired tokens gracefully
-        if not self.csrf_token:
-            self._refresh_auth_tokens()
+        # Note: We no longer refresh CSRF here - it's done before each _call_rpc()
+        # to prevent session conflicts when user visits NotebookLM in browser.
+        # Initial CSRF token from cache is used only as fallback if refresh fails.
 
     def _refresh_auth_tokens(self) -> None:
         """
@@ -571,11 +570,25 @@ class NotebookLMClient:
     ) -> Any:
         """Execute an RPC call and return the extracted result.
 
+        Always refreshes CSRF token before each call to prevent session conflicts
+        when the user also visits NotebookLM in their browser.
+
         Includes automatic retry on auth failures with three-layer recovery:
         1. Refresh CSRF/session tokens (fast, handles token expiry)
         2. Reload cookies from disk (handles external re-authentication)
         3. Run headless auth (auto-refresh if Chrome profile has saved login)
         """
+        # Always refresh CSRF token before each request to avoid conflicts
+        # with browser sessions. This adds ~1-2 sec latency but prevents
+        # "Authentication expired" errors when user visits NotebookLM in browser.
+        if not _retry:  # Don't double-refresh on retry
+            try:
+                self._refresh_auth_tokens()
+                self._client = None  # Force client recreation with new token
+            except ValueError:
+                # CSRF refresh failed - continue anyway, retry logic will handle it
+                pass
+
         client = self._get_client()
         body = self._build_request_body(rpc_id, params)
         url = self._build_url(rpc_id, path)
