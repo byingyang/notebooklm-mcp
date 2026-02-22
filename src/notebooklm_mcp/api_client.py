@@ -436,8 +436,7 @@ class NotebookLMClient:
 
             save_tokens_to_cache(cached, silent=True)
         except Exception:
-            # Silently fail - caching is an optimization, not critical
-            pass
+            logger.warning('Failed to update cached auth tokens', exc_info=True)
 
     def _get_client(self) -> httpx.Client:
         """Get or create HTTP client."""
@@ -525,7 +524,7 @@ class NotebookLMClient:
                         data = json.loads(json_str)
                         results.append(data)
                     except json.JSONDecodeError:
-                        pass
+                        logger.debug('Failed to parse JSON chunk after byte count %d: %s', byte_count, json_str[:200])
                 i += 1
             except ValueError:
                 # Not a byte count, try to parse as JSON
@@ -533,7 +532,7 @@ class NotebookLMClient:
                     data = json.loads(line)
                     results.append(data)
                 except json.JSONDecodeError:
-                    pass
+                    logger.debug('Skipping unparseable response line: %s', line[:200])
                 i += 1
 
         return results
@@ -707,8 +706,8 @@ class NotebookLMClient:
                 self._session_id = tokens.session_id
                 return True
         except Exception:
-            pass
-        
+            logger.warning('Headless auth attempt failed', exc_info=True)
+
         return False
 
     # =========================================================================
@@ -779,7 +778,7 @@ class NotebookLMClient:
     # Notebook Operations
     # =========================================================================
 
-    def list_notebooks(self, debug: bool = False) -> list[Notebook]:
+    def list_notebooks(self) -> list[Notebook]:
         """List all notebooks."""
         client = self._get_client()
 
@@ -788,28 +787,11 @@ class NotebookLMClient:
         body = self._build_request_body(self.RPC_LIST_NOTEBOOKS, params)
         url = self._build_url(self.RPC_LIST_NOTEBOOKS)
 
-        if debug:
-            print(f"[DEBUG] URL: {url}")
-            print(f"[DEBUG] Body: {body[:200]}...")
-
         response = client.post(url, content=body)
         response.raise_for_status()
 
-        if debug:
-            print(f"[DEBUG] Response status: {response.status_code}")
-            print(f"[DEBUG] Response length: {len(response.text)} chars")
-
         parsed = self._parse_response(response.text)
         result = self._extract_rpc_result(parsed, self.RPC_LIST_NOTEBOOKS)
-
-        if debug:
-            print(f"[DEBUG] Parsed chunks: {len(parsed)}")
-            print(f"[DEBUG] Result type: {type(result)}")
-            if result:
-                print(f"[DEBUG] Result length: {len(result) if isinstance(result, list) else 'N/A'}")
-                if isinstance(result, list) and len(result) > 0:
-                    print(f"[DEBUG] First item type: {type(result[0])}")
-                    print(f"[DEBUG] First item: {str(result[0])[:500]}...")
 
         notebooks = []
         if result and isinstance(result, list):
@@ -1726,7 +1708,7 @@ class NotebookLMClient:
             }
         return None
 
-    def poll_research(self, notebook_id: str, target_task_id: str | None = None) -> dict | None:
+    def poll_research(self, notebook_id: str, target_task_id: str | None = None, return_all: bool = False) -> dict | list | None:
         """Poll for research results.
 
         Call this repeatedly until status is "completed".
@@ -1869,7 +1851,9 @@ class NotebookLMClient:
             # Let's return None implies "waiting" or "not found yet"
             return None
 
-        # Return the most recent (first) task if no task_id specified
+        # Return all tasks if requested, otherwise just the most recent (first) task
+        if return_all:
+            return research_tasks
 
         return research_tasks[0]
 

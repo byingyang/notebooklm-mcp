@@ -304,7 +304,21 @@ FLASHCARD_COUNT_DEFAULT = 2
 # =============================================================================
 # Reports
 # =============================================================================
-REPORT_FORMAT_BRIEFING_DOC = "Briefing Doc"
-REPORT_FORMAT_STUDY_GUIDE = "Study Guide"
-REPORT_FORMAT_BLOG_POST = "Blog Post"
-REPORT_FORMAT_CUSTOM = "Create Your Own"
+REPORT_FORMAT_BRIEFING_DOC = 'Briefing Doc'
+REPORT_FORMAT_STUDY_GUIDE = 'Study Guide'
+REPORT_FORMAT_BLOG_POST = 'Blog Post'
+REPORT_FORMAT_CUSTOM = 'Create Your Own'
+
+# =============================================================================
+# Authentication
+# =============================================================================
+# Essential cookies for NotebookLM API authentication.
+# Only these are needed - no need to save all 20+ cookies from the browser.
+ESSENTIAL_COOKIES = [
+    'SID', 'HSID', 'SSID', 'APISID', 'SAPISID',  # Core auth cookies
+    '__Secure-1PSID', '__Secure-3PSID',  # Secure session variants
+    '__Secure-1PAPISID', '__Secure-3PAPISID',  # Secure API variants
+    'OSID', '__Secure-OSID',  # Origin-bound session
+    '__Secure-1PSIDTS', '__Secure-3PSIDTS',  # Timestamp tokens (rotate frequently)
+    'SIDCC', '__Secure-1PSIDCC', '__Secure-3PSIDCC',  # Session cookies (rotate frequently)
+]

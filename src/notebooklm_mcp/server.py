@@ -11,12 +11,17 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .api_client import NotebookLMClient, extract_cookies_from_chrome_export, parse_timestamp
+import httpx
+
+from .api_client import NotebookLMClient, AuthenticationError, extract_cookies_from_chrome_export, parse_timestamp
 from . import constants
 from . import __version__
 
-# MCP request/response logger
-mcp_logger = logging.getLogger("notebooklm_mcp.mcp")
+# Server-level logger for tool invocations
+logger = logging.getLogger('notebooklm_mcp.server')
+
+# MCP request/response logger (detailed debug)
+mcp_logger = logging.getLogger('notebooklm_mcp.mcp')
 
 # Initialize MCP server
 mcp = FastMCP(
@@ -29,13 +34,32 @@ mcp = FastMCP(
 )
 
 # Health check endpoint for load balancers and monitoring
-@mcp.custom_route("/health", methods=["GET"])
+@mcp.custom_route('/health', methods=['GET'])
 async def health_check(request: Request) -> JSONResponse:
     """Health check endpoint for load balancers and monitoring."""
+    from .auth import load_cached_tokens
+    import time
+
+    auth_status = 'no_tokens'
+    token_age_hours = None
+
+    cached = load_cached_tokens()
+    if cached:
+        age_seconds = time.time() - cached.extracted_at
+        token_age_hours = round(age_seconds / 3600, 1)
+        if cached.is_expired():
+            auth_status = 'expired'
+        else:
+            auth_status = 'valid'
+
     return JSONResponse({
-        "status": "healthy",
-        "service": "notebooklm-mcp",
-        "version": __version__,
+        'status': 'healthy',
+        'service': 'notebooklm-mcp',
+        'version': __version__,
+        'auth': {
+            'status': auth_status,
+            'token_age_hours': token_age_hours,
+        },
     })
 
 # Global state
@@ -49,20 +73,32 @@ def logged_tool():
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             tool_name = func.__name__
+            # INFO-level: tool entry with key params
+            key_params = {k: v for k, v in kwargs.items() if v is not None}
+            logger.info('Tool call: %s(%s)', tool_name, ', '.join(f'{k}={v!r}' for k, v in key_params.items()))
+
             if mcp_logger.isEnabledFor(logging.DEBUG):
-                # Log request
-                params = {k: v for k, v in kwargs.items() if v is not None}
-                mcp_logger.debug(f"MCP Request: {tool_name}({json.dumps(params, default=str)})")
-            
-            result = func(*args, **kwargs)
-            
+                mcp_logger.debug('MCP Request: %s(%s)', tool_name, json.dumps(key_params, default=str))
+
+            try:
+                result = func(*args, **kwargs)
+            except Exception:
+                logger.exception('Tool %s raised an unhandled exception', tool_name)
+                raise
+
+            # INFO-level: tool result status
+            if isinstance(result, dict):
+                status = result.get('status', 'unknown')
+                logger.info('Tool %s completed: status=%s', tool_name, status)
+            else:
+                logger.info('Tool %s completed', tool_name)
+
             if mcp_logger.isEnabledFor(logging.DEBUG):
-                # Log response (truncate if too long)
                 result_str = json.dumps(result, default=str)
                 if len(result_str) > 1000:
-                    result_str = result_str[:1000] + "..."
-                mcp_logger.debug(f"MCP Response: {tool_name} -> {result_str}")
-            
+                    result_str = result_str[:1000] + '...'
+                mcp_logger.debug('MCP Response: %s -> %s', tool_name, result_str)
+
             return result
         # Apply the MCP tool decorator
         return mcp.tool()(wrapper)
@@ -169,32 +205,39 @@ def notebook_list(max_results: int = 100) -> dict[str, Any]:
         # Count owned vs shared notebooks
         owned_count = sum(1 for nb in notebooks if nb.is_owned)
         shared_count = len(notebooks) - owned_count
-        
+
         # Count notebooks shared by me (owned + is_shared=True)
         shared_by_me_count = sum(1 for nb in notebooks if nb.is_owned and nb.is_shared)
 
         return {
-            "status": "success",
-            "count": len(notebooks),
-            "owned_count": owned_count,
-            "shared_count": shared_count,
-            "shared_by_me_count": shared_by_me_count,
-            "notebooks": [
+            'status': 'success',
+            'count': len(notebooks),
+            'owned_count': owned_count,
+            'shared_count': shared_count,
+            'shared_by_me_count': shared_by_me_count,
+            'notebooks': [
                 {
-                    "id": nb.id,
-                    "title": nb.title,
-                    "source_count": nb.source_count,
-                    "url": nb.url,
-                    "ownership": nb.ownership,
-                    "is_shared": nb.is_shared,
-                    "created_at": nb.created_at,
-                    "modified_at": nb.modified_at,
+                    'id': nb.id,
+                    'title': nb.title,
+                    'source_count': nb.source_count,
+                    'url': nb.url,
+                    'ownership': nb.ownership,
+                    'is_shared': nb.is_shared,
+                    'created_at': nb.created_at,
+                    'modified_at': nb.modified_at,
                 }
                 for nb in notebooks[:max_results]
             ],
         }
+    except (AuthenticationError, ValueError) as e:
+        logger.warning('Auth error in notebook_list: %s', e)
+        return {'status': 'error', 'error': f'Authentication expired. Run `notebooklm-mcp-auth` from a terminal. ({e})'}
+    except httpx.HTTPStatusError as e:
+        logger.error('HTTP error in notebook_list: %s', e)
+        return {'status': 'error', 'error': f'NotebookLM API error: {e.response.status_code}'}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.exception('Unexpected error in notebook_list')
+        return {'status': 'error', 'error': str(e)}
 
 
 @logged_tool()
@@ -210,16 +253,23 @@ def notebook_create(title: str = "") -> dict[str, Any]:
 
         if notebook:
             return {
-                "status": "success",
-                "notebook": {
-                    "id": notebook.id,
-                    "title": notebook.title,
-                    "url": notebook.url,
+                'status': 'success',
+                'notebook': {
+                    'id': notebook.id,
+                    'title': notebook.title,
+                    'url': notebook.url,
                 },
             }
-        return {"status": "error", "error": "Failed to create notebook"}
+        return {'status': 'error', 'error': 'Failed to create notebook'}
+    except (AuthenticationError, ValueError) as e:
+        logger.warning('Auth error in notebook_create: %s', e)
+        return {'status': 'error', 'error': f'Authentication expired. Run `notebooklm-mcp-auth` from a terminal. ({e})'}
+    except httpx.HTTPStatusError as e:
+        logger.error('HTTP error in notebook_create: %s', e)
+        return {'status': 'error', 'error': f'NotebookLM API error: {e.response.status_code}'}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.exception('Unexpected error in notebook_create')
+        return {'status': 'error', 'error': str(e)}
 
 
 @logged_tool()
@@ -470,13 +520,23 @@ def notebook_query(
 
         if result:
             return {
-                "status": "success",
-                "answer": result.get("answer", ""),
-                "conversation_id": result.get("conversation_id"),
+                'status': 'success',
+                'answer': result.get('answer', ''),
+                'conversation_id': result.get('conversation_id'),
             }
-        return {"status": "error", "error": "Failed to query notebook"}
+        return {'status': 'error', 'error': 'Failed to query notebook'}
+    except (AuthenticationError, ValueError) as e:
+        logger.warning('Auth error in notebook_query: %s', e)
+        return {'status': 'error', 'error': f'Authentication expired. Run `notebooklm-mcp-auth` from a terminal. ({e})'}
+    except httpx.HTTPStatusError as e:
+        logger.error('HTTP error in notebook_query: %s', e)
+        return {'status': 'error', 'error': f'NotebookLM API error: {e.response.status_code}'}
+    except httpx.TimeoutException as e:
+        logger.warning('Timeout in notebook_query: %s', e)
+        return {'status': 'error', 'error': 'Query timed out. Try again or increase the timeout parameter.'}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.exception('Unexpected error in notebook_query')
+        return {'status': 'error', 'error': str(e)}
 
 
 @logged_tool()
@@ -565,10 +625,15 @@ def chat_configure(
             response_length=response_length,
         )
         return result
-    except ValueError as e:
-        return {"status": "error", "error": str(e)}
+    except (AuthenticationError, ValueError) as e:
+        logger.warning('Auth/validation error in chat_configure: %s', e)
+        return {'status': 'error', 'error': str(e)}
+    except httpx.HTTPStatusError as e:
+        logger.error('HTTP error in chat_configure: %s', e)
+        return {'status': 'error', 'error': f'NotebookLM API error: {e.response.status_code}'}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.exception('Unexpected error in chat_configure')
+        return {'status': 'error', 'error': str(e)}
 
 
 @logged_tool()
@@ -806,11 +871,16 @@ def research_start(
 
             return response
 
-        return {"status": "error", "error": "Failed to start research"}
-    except ValueError as e:
-        return {"status": "error", "error": str(e)}
+        return {'status': 'error', 'error': 'Failed to start research'}
+    except (AuthenticationError, ValueError) as e:
+        logger.warning('Auth/validation error in research_start: %s', e)
+        return {'status': 'error', 'error': str(e)}
+    except httpx.HTTPStatusError as e:
+        logger.error('HTTP error in research_start: %s', e)
+        return {'status': 'error', 'error': f'NotebookLM API error: {e.response.status_code}'}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.exception('Unexpected error in research_start')
+        return {'status': 'error', 'error': str(e)}
 
 
 def _compact_research_result(result: dict) -> dict:
@@ -836,6 +906,49 @@ def _compact_research_result(result: dict) -> dict:
             result["sources_truncated"] = f"Showing first 10 of {total_sources} sources. Set compact=False for all sources."
 
     return result
+
+
+@logged_tool()
+def research_list(notebook_id: str) -> dict[str, Any]:
+    """List all research tasks for a notebook (including completed ones pending import).
+
+    Use this to see all research tasks when the UI shows multiple completed research panels.
+
+    Args:
+        notebook_id: Notebook UUID
+    """
+    try:
+        client = get_client()
+        result = client.poll_research(notebook_id, return_all=True)
+
+        if not result:
+            return {'status': 'success', 'tasks': [], 'message': 'No research tasks found'}
+
+        if isinstance(result, dict) and result.get('status') == 'no_research':
+            return {'status': 'success', 'tasks': [], 'message': 'No research tasks found'}
+
+        # Ensure result is a list
+        tasks = result if isinstance(result, list) else [result]
+
+        # Summarize each task
+        task_summaries = []
+        for task in tasks:
+            task_summaries.append({
+                'task_id': task.get('task_id'),
+                'status': task.get('status'),
+                'query': task.get('query', '')[:100] + ('...' if len(task.get('query', '')) > 100 else ''),
+                'mode': task.get('mode'),
+                'source_count': task.get('source_count', 0),
+                'has_report': bool(task.get('report')),
+            })
+
+        return {
+            'status': 'success',
+            'task_count': len(task_summaries),
+            'tasks': task_summaries,
+        }
+    except Exception as e:
+        return {'status': 'error', 'error': str(e)}
 
 
 @logged_tool()
@@ -868,11 +981,24 @@ def research_status(
             result = client.poll_research(notebook_id, target_task_id=task_id)
 
             if not result:
-                # If specific task requested but not found, keep waiting (it might appear)
+                # If specific task requested but not found, check if we should keep waiting
                 if task_id:
-                     time.sleep(poll_interval)
-                     continue
-                return {"status": "error", "error": "Failed to poll research status"}
+                    elapsed = time.time() - start_time
+                    if max_wait > 0 and elapsed < max_wait:
+                        time.sleep(poll_interval)
+                        continue
+                    # max_wait reached or max_wait=0, return task not found
+                    return {
+                        'status': 'success',
+                        'research': {
+                            'status': 'not_found',
+                            'task_id': task_id,
+                            'message': f'Task {task_id} not found after {round(elapsed, 1)}s',
+                            'polls_made': polls,
+                            'wait_time_seconds': round(elapsed, 1),
+                        }
+                    }
+                return {'status': 'error', 'error': 'Failed to poll research status'}
 
             # If completed or no research found, return immediately
             if result.get("status") in ("completed", "no_research"):
@@ -910,8 +1036,15 @@ def research_status(
             # Wait before next poll
             time.sleep(poll_interval)
 
+    except (AuthenticationError, ValueError) as e:
+        logger.warning('Auth error in research_status: %s', e)
+        return {'status': 'error', 'error': f'Authentication expired. Run `notebooklm-mcp-auth` from a terminal. ({e})'}
+    except httpx.HTTPStatusError as e:
+        logger.error('HTTP error in research_status: %s', e)
+        return {'status': 'error', 'error': f'NotebookLM API error: {e.response.status_code}'}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.exception('Unexpected error in research_status')
+        return {'status': 'error', 'error': str(e)}
 
 
 @logged_tool()
@@ -1010,18 +1143,24 @@ def research_import(
                         "title": report_result.get("title", "Deep Research Report"),
                     })
             except Exception as e:
-                # Don't fail the entire import if report import fails
-                pass
+                logger.warning('Failed to import deep research report as text source: %s', e)
 
         return {
-            "status": "success",
-            "imported_count": len(imported),
-            "total_available": len(all_sources),
-            "sources": imported,
-            "notebook_url": f"https://notebooklm.google.com/notebook/{notebook_id}",
+            'status': 'success',
+            'imported_count': len(imported),
+            'total_available': len(all_sources),
+            'sources': imported,
+            'notebook_url': f'https://notebooklm.google.com/notebook/{notebook_id}',
         }
+    except (AuthenticationError, ValueError) as e:
+        logger.warning('Auth error in research_import: %s', e)
+        return {'status': 'error', 'error': f'Authentication expired. Run `notebooklm-mcp-auth` from a terminal. ({e})'}
+    except httpx.HTTPStatusError as e:
+        logger.error('HTTP error in research_import: %s', e)
+        return {'status': 'error', 'error': f'NotebookLM API error: {e.response.status_code}'}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.exception('Unexpected error in research_import')
+        return {'status': 'error', 'error': str(e)}
 
 
 @logged_tool()
@@ -1817,18 +1956,6 @@ def mind_map_create(
 
 
 
-# Essential cookies for NotebookLM API authentication
-# Only these are needed - no need to save all 20+ cookies from the browser
-ESSENTIAL_COOKIES = [
-    "SID", "HSID", "SSID", "APISID", "SAPISID",  # Core auth cookies
-    "__Secure-1PSID", "__Secure-3PSID",  # Secure session variants
-    "__Secure-1PAPISID", "__Secure-3PAPISID",  # Secure API variants
-    "OSID", "__Secure-OSID",  # Origin-bound session
-    "__Secure-1PSIDTS", "__Secure-3PSIDTS",  # Timestamp tokens (rotate frequently)
-    "SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC",  # Session cookies (rotate frequently)
-]
-
-
 @logged_tool()
 def save_auth_tokens(
     cookies: str,
@@ -1874,7 +2001,7 @@ def save_auth_tokens(
             }
 
         # Filter to only essential cookies (reduces noise significantly)
-        cookie_dict = {k: v for k, v in all_cookies.items() if k in ESSENTIAL_COOKIES}
+        cookie_dict = {k: v for k, v in all_cookies.items() if k in constants.ESSENTIAL_COOKIES}
 
         # Try to extract CSRF token from request body if provided
         if not csrf_token and request_body:
@@ -2007,31 +2134,40 @@ Examples:
     global _query_timeout
     _query_timeout = args.query_timeout
     
-    # Configure logging
+    # Configure logging — always enable INFO for server logger (tool invocations)
+    logging.basicConfig(
+        level=logging.WARNING,  # Suppress most logs
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Server logger: always INFO so tool invocations appear in container logs
+    logger.setLevel(logging.INFO)
+    server_handler = logging.StreamHandler()
+    server_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    logger.addHandler(server_handler)
+
     if args.debug:
-        logging.basicConfig(
-            level=logging.WARNING,  # Suppress most logs
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        
-        # Shared handler and formatter for debug loggers
+        # Shared handler for debug loggers
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter(
             '%(asctime)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         ))
-        
+
         # Enable MCP request/response logging
         mcp_logger.setLevel(logging.DEBUG)
         mcp_logger.addHandler(handler)
-        
+
         # Enable API request/response logging (between MCP server and NotebookLM API)
-        api_logger = logging.getLogger("notebooklm_mcp.api")
+        api_logger = logging.getLogger('notebooklm_mcp.api')
         api_logger.setLevel(logging.DEBUG)
         api_logger.addHandler(handler)
-        
-        print("Debug logging: ENABLED (MCP tool calls + NotebookLM API requests/responses)")
+
+        print('Debug logging: ENABLED (MCP tool calls + NotebookLM API requests/responses)')
     
     if args.transport == "http":
         print(f"Starting NotebookLM MCP server (HTTP) on http://{args.host}:{args.port}{args.path}")

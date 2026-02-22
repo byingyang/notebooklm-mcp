@@ -62,10 +62,12 @@ class TestNotebookLMClientAuth:
             
             # Call RPC
             mock_client._call_rpc("rLM1Ne", [])
-            
-            # Verify refresh was called
-            mock_refresh.assert_called_once()
-            
+
+            # Verify refresh was called twice:
+            # 1) Pre-call CSRF refresh (line 585 in _call_rpc)
+            # 2) Auth failure recovery refresh (line 661 in _call_rpc)
+            assert mock_refresh.call_count == 2
+
             # Verify post was called twice
             assert http_client.post.call_count == 2
 
@@ -96,10 +98,12 @@ class TestNotebookLMClientAuth:
             
             # Execute
             result = mock_client._call_rpc("rLM1Ne", [])
-            
-            # Verify refresh called
-            mock_refresh.assert_called_once()
-            
+
+            # Verify refresh called twice:
+            # 1) Pre-call CSRF refresh
+            # 2) Auth failure recovery refresh
+            assert mock_refresh.call_count == 2
+
             # Verify success result
             assert result == {"status": "ok"}
 
